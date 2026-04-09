@@ -1729,7 +1729,7 @@ svg{display:block;flex-shrink:0}
   <div class="chat-phase">
     <div class="chat-messages" id="chatMessages">
       <div class="chat-bubble assistant">
-        👋 Hi! I'm your ChainTest AI assistant. Upload and generate a report first, then I can answer any questions about your data and findings.
+        👋 Hi! I'm ChainTest AI, your QA analysis assistant. I'm ready to help! Ask me about QA testing, upload a report for detailed analysis, or just chat. What would you like to know?
       </div>
     </div>
     <div class="prompt-chips" id="promptChips">
@@ -1740,7 +1740,7 @@ svg{display:block;flex-shrink:0}
       <div class="prompt-chip" onclick="haptic('selection');usePrompt(this)">Compare all findings</div>
     </div>
     <div class="chat-input-bar">
-      <textarea class="chat-input" id="chatInput" placeholder="Ask about your report…" rows="1"
+      <textarea class="chat-input" id="chatInput" placeholder="Ask me anything about QA testing…" rows="1"
         oninput="autoResize(this)"
         onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();haptic('light');sendChat()}"
       ></textarea>
@@ -2214,12 +2214,6 @@ function startNewReportFlow(preType){
 function navTo(screen){
   if(screen==='new'){startNewReportFlow();return}
   
-  // AI RESTRICTION: Prevent chat access without reports
-  if(screen==='chat'&&!reportStorage.hasReports()){
-    showToast('Please create a report first to use AI analysis.',true);
-    return;
-  }
-
   // Clear interval if leaving in-process monitoring
   if(ipState.monitorInterval) clearInterval(ipState.monitorInterval);
 
@@ -3333,12 +3327,6 @@ function autoResize(el){el.style.height='auto';el.style.height=Math.min(el.scrol
 function usePrompt(chip){const input=document.getElementById('chatInput');input.value=chip.textContent;autoResize(input);input.focus()}
 
 async function sendChat(){
-  // AI RESTRICTION: Require reports before chat
-  if(!reportStorage.hasReports()){
-    showToast('Please create a report first to analyze it with AI.',true);
-    return;
-  }
-  
   const input=document.getElementById('chatInput');
   const msg=input.value.trim();
   if(!msg||state.chatBusy)return;
@@ -3359,32 +3347,45 @@ async function sendChat(){
       ?`\n\nCurrent Report Data:\nTitle: ${state.reportData.title}\nType: ${state.reportData.type}\nSector: ${state.reportData.sector}\nConfidence: ${state.reportData.confidence}%\nSummary: ${state.reportData.summary?.substring(0,300)}\nMetrics: ${JSON.stringify(state.reportData.key_metrics)}\nFindings: ${JSON.stringify(state.reportData.findings)}\nRecommendations: ${JSON.stringify(state.reportData.recommendations)}`
       :'';
 
-    const systemPrompt=`You are ChainTest AI, an expert data analyst. Be concise, specific, and actionable. Format with **bold** for emphasis. Use bullet points for lists. Keep responses under 180 words unless asked for more.${reportContext}`;
+    const systemPrompt=`You are ChainTest AI, an expert data analyst and QA specialist. Be concise, specific, and actionable. Format with **bold** for emphasis. Use bullet points for lists. Keep responses under 180 words unless asked for more. Help users understand test results, identify issues, and recommend improvements.${reportContext}`;
 
     let reply='';
+    
     // Try Supabase edge function first
-    if(sb){
+    if(typeof sb!=='undefined'&&sb){
       try{
         const {data,error}=await sb.functions.invoke('lens-analyze',{
           body:{mode:'chat',chatHistory:[{systemPrompt},...state.chatHistory.map(m=>({role:m.role,content:m.content}))]}
         });
         if(!error&&data?.reply){reply=data.reply}else{throw new Error('edge fn failed')}
-      }catch{
-        // Fallback: direct Anthropic API (may fail in browser due to CORS — handled gracefully)
-        const resp=await fetch('https://api.anthropic.com/v1/messages',{
-          method:'POST',
-          headers:{'Content-Type':'application/json','anthropic-dangerous-allow-browser':'true'},
-          body:JSON.stringify({
-            model:'claude-sonnet-4-20250514',max_tokens:800,
-            system:systemPrompt,
-            messages:state.chatHistory.map(m=>({role:m.role,content:m.content}))
-          })
-        });
-        const d=await resp.json();
-        reply=d.content?.map(c=>c.text||'').join('')||'I couldn\'t process that. Please try again.';
+      }catch(supaErr){
+        // Fallback: direct Anthropic API (may fail in browser due to CORS)
+        try{
+          const resp=await fetch('https://api.anthropic.com/v1/messages',{
+            method:'POST',
+            headers:{'Content-Type':'application/json','anthropic-dangerous-allow-browser':'true'},
+            body:JSON.stringify({
+              model:'claude-sonnet-4-20250514',
+              max_tokens:800,
+              system:systemPrompt,
+              messages:state.chatHistory.map(m=>({role:m.role,content:m.content}))
+            })
+          });
+          if(!resp.ok)throw new Error('API error');
+          const d=await resp.json();
+          reply=d.content?.map(c=>c.text||'').join('')||'I couldn\'t process that. Please try again.';
+        }catch(apiErr){
+          // Use local fallback
+          reply=generateLocalReply(msg,state.reportData);
+        }
       }
     } else {
       // No Supabase — provide intelligent fallback
+      reply=generateLocalReply(msg,state.reportData);
+    }
+
+    // Ensure we have a reply
+    if(!reply||reply.trim()===''){
       reply=generateLocalReply(msg,state.reportData);
     }
 
@@ -3392,6 +3393,7 @@ async function sendChat(){
     state.chatHistory.push({role:'assistant',content:reply});
     haptic('light');
   }catch(e){
+    console.error('Chat error:',e);
     typing.remove();
     const fallback=generateLocalReply(msg,state.reportData);
     state.chatHistory.push({role:'assistant',content:fallback});
@@ -3404,19 +3406,51 @@ async function sendChat(){
 // Local AI fallback when network unavailable
 function generateLocalReply(msg,report){
   const q=msg.toLowerCase();
+  
+  // General QA questions (no report needed)
+  if(q.includes('hello')||q.includes('hi')||q.includes('hey'))
+    return'👋 Hello! I\'m ChainTest AI, your QA analysis assistant. I can help you analyze test reports, answer questions about quality metrics, and provide insights. Upload a report to get started, or ask me anything about QA testing!';
+  
+  if(q.includes('what can you do')||q.includes('how')||q.includes('capabilities'))
+    return'**My Capabilities:**\n• 📊 Analyze QA test reports and findings\n• 🔍 Identify trends and patterns in test data\n• ✅ Provide quality metrics interpretation\n• 📈 Recommend actionable next steps\n• 💡 Answer questions about test results\n• ⚡ Generate insights from test data\n\nGenerate or upload a report to unlock full analysis!';
+  
   if(!report){
-    if(q.includes('hello')||q.includes('hi'))return'👋 Hello! I\'m ready to help. Generate a report first, then I can answer detailed questions about your data.';
-    return'I\'m ready to help! Please generate a report first by uploading a file and clicking **Validate & Analyse**. Then I can answer specific questions about your findings.';
+    if(q.includes('file')||q.includes('upload')||q.includes('report')||q.includes('test'))
+      return'📁 To analyze reports, please:\n1. **Upload a file** (CSV, PDF, JSON)\n2. **Click Validate & Analyse**\n3. **Return to Chat** to discuss findings\n\nOr ask me general QA questions anytime!';
+    
+    if(q.includes('pass')||q.includes('fail')||q.includes('status')||q.includes('verdict'))
+      return'I don\'t have an active report to check. Please **upload and analyze a file** first, then I can review test status, verdicts, and findings with you.';
+    
+    return'I\'m ready to help! 🚀\n\n**Without a report:** I can answer general QA questions.\n**With a report:** I can provide detailed analysis of your test results.\n\nWhat would you like to know about testing?';
   }
-  if(q.includes('summary')||q.includes('overview'))return`**Executive Summary:**\n${report.executive_insight}\n\n${report.confidence}% confidence · ${report.key_metrics?.length} metrics extracted · ${report.findings?.length} findings identified.`;
-  if(q.includes('risk')||q.includes('finding')){
-    const high=report.findings?.filter(f=>f.severity==='high')||[];
-    return`**Key Risks (${report.findings?.length} total):**\n${high.length?`🔴 **High:** ${high[0]?.title}`:''}\n\n${report.findings?.slice(0,2).map(f=>`• **[${f.severity.toUpperCase()}]** ${f.title}`).join('\n')}`;
+
+  // With report available
+  if(q.includes('summary')||q.includes('overview')||q.includes('what'))
+    return`**Report Summary:**\n📄 **${report.title}**\n\n${report.executive_insight||'Complete analysis available.'}\n\n📊 **Confidence:** ${report.confidence||'N/A'}%\n🎯 **Metrics:** ${report.key_metrics?.length||0} tracked`;
+  
+  if(q.includes('risk')||q.includes('finding')||q.includes('issue')||q.includes('problem')){
+    const findings=report.findings||[];
+    const high=findings.filter(f=>f.severity==='high')||[];
+    const med=findings.filter(f=>f.severity==='medium')||[];
+    return`**Findings Breakdown (${findings.length} total):**\n🔴 **Critical:** ${high.length}\n🟡 **Medium:** ${med.length}\n\n${high.length?`**Top Issue:** ${high[0]?.title||'Critical finding detected'}`:'✅ No critical issues found!'}\n\n${findings.slice(0,2).map(f=>`• **[${(f.severity||'').toUpperCase()}]** ${f.title}`).join('\n')}`;
   }
-  if(q.includes('metric')||q.includes('kpi'))return`**Top Metrics:**\n${(report.key_metrics||[]).map(m=>`• **${m.key}:** ${m.val} (${m.trend})`).join('\n')}`;
-  if(q.includes('recommend')||q.includes('action')||q.includes('next'))return`**Priority Actions:**\n${(report.recommendations||[]).slice(0,3).map((r,i)=>`${i+1}. **${r.title}** — ${r.timeline||'ASAP'}`).join('\n')}`;
-  if(q.includes('priorit')||q.includes('focus'))return`**Immediate priorities:**\n1. 🔴 ${report.findings?.find(f=>f.severity==='high')?.title||'Review high-severity findings'}\n2. 📊 Address data quality gaps flagged in the report\n3. ✅ Begin implementing recommendation #1`;
-  return`Based on the **${report.title}** (${report.confidence}% confidence):\n\n${report.executive_insight}\n\nWhat specific aspect would you like to explore? I can detail findings, metrics, or recommendations.`;
+  
+  if(q.includes('metric')||q.includes('kpi')||q.includes('data')||q.includes('performance')){
+    const metrics=report.key_metrics||[];
+    return`**Key Metrics (${metrics.length} total):**\n${metrics.length?metrics.map(m=>`• **${m.key||'Metric'}:** ${m.val||'N/A'} ${m.trend?'('+ m.trend+')':''}`).join('\n'):'No metrics available.'}\n\n📈 Review the full report for detailed analysis!`;
+  }
+  
+  if(q.includes('recommend')||q.includes('action')||q.includes('next')||q.includes('improve')){
+    const recs=report.recommendations||[];
+    return`**Recommended Actions:**\n${recs.length?recs.slice(0,4).map((r,i)=>`${i+1}. **${r.title||'Action '+i}** (${r.timeline||'Upcoming'})`).join('\n'):'💡 Review findings to generate recommendations.'}\n\n✨ Prioritize based on severity and impact!`;
+  }
+  
+  if(q.includes('quality')||q.includes('pass')||q.includes('success')||q.includes('rate')){
+    const passed=(report.key_metrics||[]).find(m=>m.key?.includes('Pass'))||{val:'N/A'};
+    return`**Quality Assessment:**\n✅ **Pass Rate:** ${passed.val||'Check metrics'}\n⭐ **Confidence:** ${report.confidence||'N/A'}%\n📊 **Status:** ${report.verdict||'Pending review'}\n\nQuality looks good! Continue monitoring.`;
+  }
+  
+  return`**Report Analysis Available:**\n${report.title?'📄 **' + report.title + '**':'📋 Report loaded'}\n\nI can help with:\n• 📊 Metrics & KPIs\n• 🔍 Findings & risks\n• ✅ Quality assessment\n• 📈 Recommendations\n• 📉 Trends & insights\n\nWhat would you like to explore?`;
 }
 
 function renderChat(){
